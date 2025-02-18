@@ -3,7 +3,7 @@ import openmeteo_requests
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query, Body
 from pydantic import BaseModel, Field
 
 url = "https://api.open-meteo.com/v1/forecast"
@@ -16,9 +16,22 @@ class Location(BaseModel):
     latitude: float = Field(59.95, ge=-90, le=90)
     longitude: float = Field(30.32, ge=-180, le=180)
 
-@app.get("/weather/now")
+class WeatherData(BaseModel):
+    temperature: float
+    humidity: float = Field(ge=0, le=100)
+    precipitation: float = Field(ge=0)
+    pressure: float = Field(ge=0)
+    wind_speed: float = Field(ge=0)
+    wind_direction: int = Field(ge=0, le=360)
+
+class Forecast(BaseModel):
+    time: datetime
+    data: WeatherData
+
+tracked_cities: dict[str, tuple[Location, list[Forecast]]] = {}
+
+@app.get("/weather/now", description="Return temperature, pressure and wind speed for current time given the coordinates.")
 async def current_weather(location: Annotated[Location, Query(title="Valid geographic coordinates")]):
-    """Return temperature, pressure and wind speed for current time given the coordinates."""
     params = {
         "latitude": location.latitude,
         "longitude": location.longitude,
@@ -50,3 +63,25 @@ async def current_weather(location: Annotated[Location, Query(title="Valid geogr
         "wind_speed": wind_speed,
         "pressure": pressure
             }
+
+@app.post("/tracking", description="Add city with its location coordinates to forecast-tracking map.")
+async def add_city(
+                    city: Annotated[str, Body(
+                                            title="Name of city",
+                                            description="Used like a label for geographic coordinates.",
+                                            pattern=r"[^\W\d_]+",
+                                            examples=[
+                                                "Санкт-Петербург"
+                                            ])
+                                    ],
+                    location: Annotated[Location, Body(title="Coordinates of given city")]
+                    ):
+    if city in tracked_cities:
+        return
+    else:
+        tracked_cities[city] = (location, [])
+        return
+
+@app.get("/tracking", description="Returns cities which are in forecast-tracking map.")
+async def show_tracked():
+    return { "cities": list(tracked_cities.keys()) }
