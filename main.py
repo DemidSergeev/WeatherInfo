@@ -19,6 +19,9 @@ retry_session = retry(cache_session, retries=5, backoff_factor=0.2)
 openmeteo = openmeteo_requests.Client(session=retry_session)
 url = "https://api.open-meteo.com/v1/forecast"
 
+connection = sqlite3.connect("tracked_cities.db") 
+cursor = connection.cursor()
+
 class Location(BaseModel):
     """Model class for coupling together `latitude` and `longitude`."""
 
@@ -40,7 +43,7 @@ class WeatherData(BaseModel):
 class ForecastQueryParameters(BaseModel):
     """Model class for specifying whether some weather parameter should be returned or not."""
 
-    daytime: str | None = Field(None, max_length=5, description="Daytime in HH:mm format.")
+    daytime: str | None = Field(None, max_length=5, description="Daytime in HH:mm format. If not provided, using current time.")
     temperature: bool | None = True
     humidity: bool | None = True
     precipitation: bool | None = True
@@ -80,6 +83,8 @@ def update_forecasts_for_city(city: str) -> None:
 
     tracked_cities[city].forecasts = parse_forecasts(response)
 
+    dump_to_db(tracked_cities)
+
 
 def update_forecasts() -> None:
     """Updates forecast-tracking map (`tracked_cities`) with new data."""
@@ -102,11 +107,13 @@ def update_forecasts() -> None:
         response = responses[i]
         city_weather_data.forecasts = parse_forecasts(response)
 
+    dump_to_db(tracked_cities)
+
         
 def parse_forecasts(response):
     """Return forecasts list parsed from open-meteo API response."""
 
-    forecasts = []
+    forecasts: list[Forecast] = []
     # Get 15-minute interval data
     minutely_15 = response.Minutely15()
     temperature = minutely_15.Variables(0).ValuesAsNumpy()
@@ -129,7 +136,7 @@ def parse_forecasts(response):
     
     for i in range(len(time_range)):
         new_forecast = Forecast(
-            time=time_range[i],
+            time=time_range[i].to_pydatetime(),
             data=WeatherData(
                 temperature= temperature[i],
                 humidity=humidity[i],
@@ -144,16 +151,23 @@ def parse_forecasts(response):
     return forecasts
 
 
-tracked_cities: dict[str, CityWeatherData] = {}
 
-
-def dump_to_db(cursor: sqlite3.Cursor, tracked_cities: dict[str, CityWeatherData]) -> None:
+def dump_to_db(tracked_cities: dict[str, CityWeatherData]) -> None:
     """Serialize forecast-tracking map into JSON and store in sqlite3 database"""
 
-    json_data = json.dumps(tracked_cities, default=lambda o: o.model_dump() if isinstance(o, BaseModel) else None)
-    cursor.execute("INSERT INTO weather_data (data) VALUES (?)", (json_data,))
+    def custom_serializer(obj):
+        if isinstance(obj, BaseModel):
+            return obj.model_dump()
+        elif isinstance(obj, datetime):
+            return obj.isoformat()
+        else:
+            return None
 
-def load_from_db(cursor: sqlite3.Cursor) -> dict[str, CityWeatherData]:
+    json_data = json.dumps(tracked_cities, default=custom_serializer, ensure_ascii=False)
+    cursor.execute("INSERT INTO weather_data (data) VALUES (?)", (json_data,))
+    connection.commit()
+
+def load_from_db() -> dict[str, CityWeatherData]:
     """Load JSON from DB and deserialize into forecast-tracking map"""
 
     # Load JSON from DB
@@ -163,23 +177,43 @@ def load_from_db(cursor: sqlite3.Cursor) -> dict[str, CityWeatherData]:
         return {}
     
     json_data = row[0]
-
+    print(f"json: {json_data}") 
     # Deserialize JSON into forecast-tracking map
     def custom_decoder(obj):
-        if "latitude" in obj and "longitude" in obj:
-            return Location(**obj)
-        if "time" in obj and "data" in obj:
-            return Forecast(time=datetime.fromisoformat(obj["time"]), data=WeatherData(**obj["data"]))
+        if isinstance(obj, dict):
+            # Decode Location
+            if "latitude" in obj and "longitude" in obj:
+                return Location(**obj)
+            
+            # Decode Forecast
+            if "time" in obj and "data" in obj:
+                return Forecast(
+                    time=datetime.fromisoformat(obj["time"]),
+                    data=WeatherData(**obj["data"])
+                )
+            
+            # Decode CityWeatherData
+            if "location" in obj and "forecasts" in obj:
+                return CityWeatherData(
+                    location=obj["location"],
+                    forecasts=[Forecast(
+                        time=forecast.time,
+                        data=forecast.data
+                    ) for forecast in obj["forecasts"]]
+                )
+        
         return obj
 
     tracked_cities = json.loads(json_data, object_hook=custom_decoder)
+    print(f"dict: {tracked_cities}")
     return tracked_cities
+
+
+tracked_cities: dict[str, CityWeatherData] = load_from_db()
 
 # This context manager performs startup and shutdown operations and is passed into FastAPI app instance
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    connection = sqlite3.connect("tracked_cities.db") 
-    cursor = connection.cursor()
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS weather_data (
@@ -189,8 +223,6 @@ async def lifespan(app: FastAPI):
     """)
     connection.commit()
     
-    # Load forecast-tracking map from DB
-    tracked_cities = load_from_db(cursor)
     scheduler = BackgroundScheduler()
     scheduler.add_job(update_forecasts, "interval", minutes=15)
     scheduler.start()
@@ -200,8 +232,6 @@ async def lifespan(app: FastAPI):
     yield
 
     scheduler.shutdown()
-    dump_to_db(cursor, tracked_cities)
-    connection.commit()
     connection.close()
 
 
@@ -258,6 +288,8 @@ async def add_city(city: Annotated[str, Body(
     if city not in tracked_cities:
         tracked_cities[city] = CityWeatherData(location=location, forecasts=[])
         update_forecasts_for_city(city)
+    else:
+        raise HTTPException(status_code=409, detail="City is already tracked.")
 
 @app.get("/tracking", description="Returns cities which are in forecast-tracking map.")
 async def get_tracked():
