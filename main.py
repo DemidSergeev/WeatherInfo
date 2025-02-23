@@ -84,8 +84,6 @@ def update_forecasts_for_city(city: str) -> None:
 
     tracked_cities[city].forecasts = parse_forecasts(response)
 
-    dump_weather_to_db(tracked_cities)
-
 
 def update_forecasts() -> None:
     """Updates forecast-tracking map (`tracked_cities`) with new data."""
@@ -290,6 +288,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 
+# 1. Метод принимает координаты и возвращает данные о температуре, скорости ветра и атмосферном давлении на момент запроса.
 @app.get("/weather/now", description="Return temperature, pressure and wind speed for current time given the coordinates.")
 async def current_weather(location: Annotated[Location, Query(title="Valid geographic coordinates")]):
     """Perform request to open-meteo API to receive current-time temperatue, pressure and wind speed in the given `location`."""
@@ -323,8 +322,12 @@ async def current_weather(location: Annotated[Location, Query(title="Valid geogr
         "pressure": pressure
             }
 
-@app.post("/tracking", description="Add city with its location coordinates to forecast-tracking map.")
-async def add_city(city: Annotated[str, Body(
+
+# Метод 2. Метод принимает ID пользователя, название города и его координаты и добавляет в список городов для которых отслеживается прогноз погоды (для данного пользователя).
+@app.post("/tracking/{user_id}", description="Add city with its location coordinates to forecast-tracking map.")
+async def add_city(user_id: Annotated[str, Path(description="Lowercase hex string representing user id.",
+                                                pattern=r"(0x)?[0-9a-f]+")],
+                   city: Annotated[str, Body(
                                             title="Name of city",
                                             description="Used like a label for geographic coordinates.",
                                             pattern=r"^[ a-zA-Zа-яА-ЯёЁ-]+$",
@@ -333,33 +336,46 @@ async def add_city(city: Annotated[str, Body(
                                             ])
                                     ],
                     location: Annotated[Location, Body(title="Coordinates of given city")]):
-    """Add `location` into forecast-tracking map for key `city`.
+    """Add `location` into forecast-tracking map for key `city`. Add `city` to set of cities tracked by `user_id`.
     
     If `city` already exists, do nothing."""
 
+    id = int(user_id, base=16)
+    if city not in users[id][1]:
+        users[id][1].add(city)
+        dump_users_to_db(users)
+    else:
+        raise HTTPException(status_code=409, detail="City is already tracked.")
     if city not in tracked_cities:
         tracked_cities[city] = CityWeatherData(location=location, forecasts=[])
         update_forecasts_for_city(city)
-    else:
-        raise HTTPException(status_code=409, detail="City is already tracked.")
+        dump_weather_to_db(tracked_cities)
 
-@app.get("/tracking", description="Returns cities which are in forecast-tracking map.")
-async def get_tracked():
+
+# Метод 3. Метод принимает ID пользователя и возвращает список городов, для которых доступен прогноз погоды (отслеживаемых пользоваетелем).
+@app.get("/tracking/{user_id}", description="Returns cities which are in forecast-tracking map.")
+async def get_tracked(user_id: Annotated[str, Path(description="Lowercase hex string representing user id.",
+                                                   pattern=r"(0x)?[0-9a0f]+")]):
     """Return a list of cities that are currently being tracked for forecasts."""
-    return { "cities": list(tracked_cities.keys()) }
+    return { "cities": list(users[int(user_id, base=16)][1]) }
 
-@app.get("/tracking/{city}", description="Returns today's forecast for specified city and daytime.")
-async def get_forecast(city: Annotated[str, Path(title="City name.",
+
+# Метод 4. Метод принимает Id пользователя, название города и время и возвращает для него погоду на текущий день в указанное время.
+@app.get("/tracking/{user_id}/{city}", description="Returns today's forecast for specified city and daytime.")
+async def get_forecast(user_id: Annotated[str, Path(description="Lowercase hex string representing user id.",
+                                                   pattern=r"(0x)?[0-9a0f]+")],
+                        city: Annotated[str, Path(title="City name.",
                                                  description="Name of the city. It must already exist in forecast-tracking map.",
                                                  pattern=r"^[ a-zA-Zа-яА-ЯёЁ-]+$")],
                         parameters: Annotated[ForecastQueryParameters, Query()]):
-    """Return forecast for specified daytime for a city that exists in forecast-tracking map.
+    """Return forecast for specified daytime for a city that is tracked by user.
     
     It returns a closest preceding forecast.
     If city is not tracked, return 404 status code."""
 
-    if city not in tracked_cities:
-        raise HTTPException(status_code=404, detail="City not found in forecast-tracking map.")
+    id = int(user_id, base=16)
+    if city not in users[id][1]:
+        raise HTTPException(status_code=404, detail="City is not tracked by user.")
 
     forecast_datetime = datetime.now()
     daytime = parameters.daytime
@@ -411,7 +427,7 @@ async def register(username: Annotated[str, Query(description="Username consisti
     """Add user to users map and return encoded id."""
     id = short_hash(username)
     if id in users:
-        raise HTTPException(status_code=409, detail="This username already exists.")
+        raise HTTPException(status_code=409, detail=f"This username already exists (user_id: {hex(id)}).")
     else:
         users[id] = (username, set())
         dump_users_to_db(users)
