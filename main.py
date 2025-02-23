@@ -2,7 +2,8 @@ import openmeteo_requests
 import requests_cache
 from retry_requests import retry
 
-from datetime import datetime, date, time
+from datetime import datetime, date
+from hashlib import sha256
 from typing import Annotated
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -83,7 +84,7 @@ def update_forecasts_for_city(city: str) -> None:
 
     tracked_cities[city].forecasts = parse_forecasts(response)
 
-    dump_to_db(tracked_cities)
+    dump_weather_to_db(tracked_cities)
 
 
 def update_forecasts() -> None:
@@ -107,7 +108,7 @@ def update_forecasts() -> None:
         response = responses[i]
         city_weather_data.forecasts = parse_forecasts(response)
 
-    dump_to_db(tracked_cities)
+    dump_weather_to_db(tracked_cities)
 
         
 def parse_forecasts(response):
@@ -151,9 +152,8 @@ def parse_forecasts(response):
     return forecasts
 
 
-
-def dump_to_db(tracked_cities: dict[str, CityWeatherData]) -> None:
-    """Serialize forecast-tracking map into JSON and store in sqlite3 database"""
+def dump_weather_to_db(tracked_cities: dict[str, CityWeatherData]) -> None:
+    """Serialize forecast-tracking map into JSON and store in sqlite3 database."""
 
     def custom_serializer(obj):
         if isinstance(obj, BaseModel):
@@ -167,17 +167,48 @@ def dump_to_db(tracked_cities: dict[str, CityWeatherData]) -> None:
     cursor.execute("INSERT INTO weather_data (data) VALUES (?)", (json_data,))
     connection.commit()
 
-def load_from_db() -> dict[str, CityWeatherData]:
-    """Load JSON from DB and deserialize into forecast-tracking map"""
 
-    # Load JSON from DB
-    cursor.execute("SELECT data FROM weather_data ORDER BY id DESC LIMIT 1")
-    row = cursor.fetchone()
-    if not row:
-        return {}
+def dump_users_to_db(users: dict[int, (str, set[str])]) -> None:
+    """"Serialize users map into JSON and store in sqlite3 database."""
+
+    def custom_serializer(obj):
+        if isinstance(obj, tuple):
+            return list(obj)
+        elif isinstance(obj, set):
+            return list(obj)
+        else:
+            return None
     
-    json_data = row[0]
-    print(f"json: {json_data}") 
+    json_data = json.dumps(users, default=custom_serializer, ensure_ascii=False)
+    cursor.execute("INSERT INTO users (data) VALUES (?)", (json_data,))
+    connection.commit()
+
+
+def load_users_from_db() -> (dict[int, (str, set[str])]):
+    """Load JSON from users DB and deserialize into users map."""
+
+    json_data = fetch_from_table("users")
+
+    if not json_data:
+        return {}
+
+    parsed_data = json.loads(json_data)
+
+    deserialized_data = {
+        int(key): (value[0], set(value[1]))
+        for key, value in parsed_data.items()
+    }
+
+    return deserialized_data
+
+
+def load_weather_from_db() -> dict[str, CityWeatherData]:
+    """Load JSON from weather_data DB and deserialize into forecast-tracking map."""
+
+    json_data = fetch_from_table("weather_data")
+    if not json_data:
+        return {}
+
     # Deserialize JSON into forecast-tracking map
     def custom_decoder(obj):
         if isinstance(obj, dict):
@@ -205,15 +236,28 @@ def load_from_db() -> dict[str, CityWeatherData]:
         return obj
 
     tracked_cities = json.loads(json_data, object_hook=custom_decoder)
-    print(f"dict: {tracked_cities}")
     return tracked_cities
 
 
-tracked_cities: dict[str, CityWeatherData] = load_from_db()
+def fetch_from_table(table: str):
+    """Fetch JSON data from `table` from DB."""
+
+    cursor.execute(f"SELECT data FROM {table} ORDER BY id DESC LIMIT 1")
+    row = cursor.fetchone()
+    if not row:
+        return None
+    
+    return row[0]
+
+
+tracked_cities: dict[str, CityWeatherData] = {}
+users: dict[int, (str, set[str])] = {}
+
 
 # This context manager performs startup and shutdown operations and is passed into FastAPI app instance
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global tracked_cities, users
 
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS weather_data (
@@ -221,8 +265,16 @@ async def lifespan(app: FastAPI):
         data TEXT
     )
     """)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        data TEXT
+    )
+    """)
     connection.commit()
     
+    tracked_cities = load_weather_from_db()
+    users = load_users_from_db()
     scheduler = BackgroundScheduler()
     scheduler.add_job(update_forecasts, "interval", minutes=15)
     scheduler.start()
@@ -275,7 +327,7 @@ async def current_weather(location: Annotated[Location, Query(title="Valid geogr
 async def add_city(city: Annotated[str, Body(
                                             title="Name of city",
                                             description="Used like a label for geographic coordinates.",
-                                            pattern=r"^[a-zA-Zа-яА-ЯёЁ-]+$",
+                                            pattern=r"^[ a-zA-Zа-яА-ЯёЁ-]+$",
                                             examples=[
                                                 "Санкт-Петербург"
                                             ])
@@ -299,7 +351,7 @@ async def get_tracked():
 @app.get("/tracking/{city}", description="Returns today's forecast for specified city and daytime.")
 async def get_forecast(city: Annotated[str, Path(title="City name.",
                                                  description="Name of the city. It must already exist in forecast-tracking map.",
-                                                 pattern=r"^[a-zA-Zа-яА-ЯёЁ-]+$")],
+                                                 pattern=r"^[ a-zA-Zа-яА-ЯёЁ-]+$")],
                         parameters: Annotated[ForecastQueryParameters, Query()]):
     """Return forecast for specified daytime for a city that exists in forecast-tracking map.
     
@@ -329,7 +381,7 @@ async def get_forecast(city: Annotated[str, Path(title="City name.",
     # Filter the forecast data based on the requested parameters
     filtered_data = {
         field: getattr(forecast.data, field)
-        for field in parameters.dict()
+        for field in parameters.model_dump()
         if field != "daytime" and getattr(parameters, field) is True
     }
     return filtered_data
@@ -353,6 +405,21 @@ def search_forecast(forecasts: list[Forecast], forecast_datetime: datetime) -> F
         
     return result
 
+@app.post("/register", description="Register user and return id.")
+async def register(username: Annotated[str, Query(description="Username consisting of alphanumeric characters and underscores. Max length is 32 characters.",
+                                                max_length=32, pattern=r"^[a-zA-Zа-яА-ЯёЁ0-9_-]+$")]):
+    """Add user to users map and return encoded id."""
+    id = short_hash(username)
+    if id in users:
+        raise HTTPException(status_code=409, detail="This username already exists.")
+    else:
+        users[id] = (username, set())
+        dump_users_to_db(users)
+        return hex(id)
+
+def short_hash(username: str) -> int:
+    """Generate hash in range(16 ** 7)."""
+    return int(sha256(username.encode()).hexdigest(), base=16) % (16 ** 7)
 
 if __name__ == "__main__":
     import uvicorn
