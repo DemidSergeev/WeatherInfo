@@ -252,9 +252,9 @@ tracked_cities: dict[str, CityWeatherData] = {}
 users: dict[int, (str, set[str])] = {}
 
 
-# This context manager performs startup and shutdown operations and is passed into FastAPI app instance
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    """This context manager performs startup and shutdown operations and is passed into FastAPI app instance."""
     global tracked_cities, users
 
     cursor.execute("""
